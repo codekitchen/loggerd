@@ -15,6 +15,10 @@ import std.range;
 
 enum VERSION = "1.0.0";
 
+alias InputRange!(char[]) InputStream;
+alias OutputRange!(const char[]) OutputStream;
+alias outputRangeObject!(const char[]) outputStream;
+
 void main(string[] args) {
   bool use_udp = true;
   int priority = LOG_NOTICE;
@@ -40,9 +44,8 @@ void main(string[] args) {
   );
 
   stdout.close();
-  InputRange!(char[]) input;
-  OutputRange!(const char[]) output;
-  alias outputRangeObject!(const char[]) to_output;
+  InputStream input;
+  OutputStream output;
 
   // remove the program name from args, then see if a message was passed on the
   // command line
@@ -71,11 +74,11 @@ void main(string[] args) {
   }
 
   if (socket) {
-    output = to_output(SocketSink(socket));
+    output = outputStream(SocketSink(socket));
     // when sending over a socket we have to do our own syslog-compliant message formatting
     input = input.syslog_formatter(tag, log_flags, priority).inputRangeObject;
   } else {
-    output = to_output(new SyslogSink(tag, log_flags, priority));
+    output = outputStream(new SyslogSink(tag, log_flags, priority));
   }
 
   copy(input, output);
