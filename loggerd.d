@@ -1,123 +1,140 @@
+import core.stdc.string;
+import core.stdc.time;
 import core.sys.posix.syslog;
 import core.sys.posix.unistd : getlogin, getpid;
-import core.stdc.time;
-import core.stdc.string;
+import std.algorithm;
 import std.c.stdlib : exit;
 import std.conv;
-import std.datetime;
+import std.exception;
 import std.getopt;
 import std.path;
 import std.socket;
 import std.stdio;
 import std.string;
-import core.memory;
+import std.range;
 
 enum VERSION = "1.0.0";
 
 void main(string[] args) {
-  bool use_udp;
+  bool use_udp = true;
   int priority = LOG_NOTICE;
-  ushort udp_port = 514;
+  ushort server_port = 514;
   string tag = getlogin().to!(string),
-         unix_addr, udp_addr;
+         unix_addr, server_addr;
   int log_flags;
-  size_t max_line_size = 65536;
-
-  // TODO: the next release of D updates std.getopt to auto-generate this
-  // help text, so I bailed on doing it manually
-  auto print_help = {
-    writefln("
-Usage:
-%s [options] [message]
-", args[0].baseName);
-    exit(0);
-  };
 
   getopt(args,
       std.getopt.config.bundling,
-      "id|i", { log_flags |= LOG_PID; },
-      "stderr|s", { log_flags |= LOG_PERROR; },
-      "file|f", (string _, string fname) { freopen(fname.toStringz, "r", stdin.getFP); },
-      "priority|p", (string _, string p) { priority = parse_priority(p); },
-      "tag|t", &tag,
-      "socket|u", &unix_addr,
-      "udp|d", &use_udp,
-      "server|n", &udp_addr,
-      "port|P", &udp_port,
+      "id|i",        { log_flags |= LOG_PID; },
+      "stderr|s",    { log_flags |= LOG_PERROR; },
+      "file|f",      (string _, string fname) { freopen(fname.toStringz, "r", stdin.getFP); },
+      "priority|p",  (string _, string p) { priority = parse_priority(p); },
+      "tag|t",       &tag,
+      "socket|u",    &unix_addr,
+      "udp|d",       &use_udp,
+      "server|n",    &server_addr,
+      "port|P",      &server_port,
       "version|v|V", { writefln("%s version %s", args[0].baseName, VERSION); exit(0); },
-      "help|h", print_help,
-      "max|m", &max_line_size,
+      // TODO: the next release of D updates std.getopt to auto-generate
+      // help text, so I punted on doing it manually
   );
 
-  Socket socket;
-  if (udp_addr) {
-    socket = new Socket(AddressFamily.INET, SocketType.DGRAM);
-    socket.connect(new InternetAddress(udp_addr, udp_port));
-  } else if (unix_addr) {
-    socket = new Socket(AddressFamily.UNIX, use_udp ? SocketType.DGRAM : SocketType.STREAM);
-    socket.connect(new UnixAddress(unix_addr));
-  } else { // write directly to syslog() C function
-    openlog(tag.toStringz, log_flags, 0);
-  }
-
   stdout.close();
-
-  char[25] pid_buffer;
-  char[] socket_message_buffer;
-  time_t now;
-
-  // line is assumed to be null-terminated already
-  void log_line(const char[] line) {
-    if (socket) {
-      const char[] pid = (log_flags & LOG_PID) ? sformat(pid_buffer, "[%d]", getpid()) : "";
-      // this odd timestamp format is what syslog requires, it's from the ctime() C function,
-      // truncated to the first 15 chars
-      // http://www.ietf.org/rfc/rfc3164.txt
-      time(&now);
-      char[] tp = (ctime(&now)+4)[0..15];
-
-      size_t needed_size = 25 /* priority fudge */ + tp.length + tag.length + pid.length + line.length + 7;
-      if (socket_message_buffer.length < needed_size) {
-        socket_message_buffer.length = needed_size;
-      }
-
-      // using C snprintf here instead of std.string.sformat, since I saw GC
-      // allocations with sformat
-      snprintf(socket_message_buffer.ptr, socket_message_buffer.length,
-          "<%d>%.15s %.*s%.*s: %s\n",
-          priority, tp.ptr, tag.length, tag.ptr, pid.length, pid.ptr, line.ptr);
-      auto message = socket_message_buffer[0..strlen(socket_message_buffer.ptr)];
-      socket.send(message);
-      if (log_flags & LOG_PERROR)
-        stderr.write(message);
-    } else {
-      syslog(priority, "%s", line.ptr);
-    }
-  }
+  InputRange!(char[]) input;
+  OutputRange!(const char[]) output;
+  alias outputRangeObject!(const char[]) to_output;
 
   // remove the program name from args, then see if a message was passed on the
   // command line
   auto message_args = args[1..$];
   if (message_args.length > 0) {
-    log_line(message_args.join(" ") ~ '\0');
+    input = [(message_args.join(" ") ~ '\0').dup].inputRangeObject;
   } else {
-    char[] buffer = new char[max_line_size];
-    while (fgets(buffer.ptr, cast(int)buffer.length, stdin.getFP) != null) {
-      // comment from logger.c:
-      // glibc is buggy and adds an additional newline,
-      // so we have to remove it here until glibc is fixed
-      size_t len = strlen(buffer.ptr);
-      if (len > 0  && buffer[len-1] == '\n')
-        buffer[len-1] = '\0';
-
-      log_line(buffer[0..len]);
-    }
+    // byLine keeps an internal buffer, which can reallocate when we read a
+    // bigger line than we've seen before, and doesn't ever shrink
+    // this should result in very few allocations overall, which my testing confirms
+    input = stdin.byLine(KeepTerminator.yes)
+                 // skip blank lines -- length 1 not 0, because it includes the newline
+                 .filter!("a.length > 1")
+                 // turn the trailing newline into a null byte to make this a C string
+                 .map!((s) { if(s.length>0) s[$-1] = '\0'; return s; })
+                 .inputRangeObject;
   }
 
-  if(!socket)
-    closelog();
+  Socket socket;
+  if (server_addr) {
+    socket = new Socket(AddressFamily.INET, use_udp ? SocketType.DGRAM : SocketType.STREAM);
+    socket.connect(new InternetAddress(server_addr, server_port));
+  } else if (unix_addr) {
+    socket = new Socket(AddressFamily.UNIX, SocketType.STREAM);
+    socket.connect(new UnixAddress(unix_addr));
+  }
+
+  if (socket) {
+    output = to_output(SocketSink(socket));
+    // when sending over a socket we have to do our own syslog-compliant message formatting
+    input = input.syslog_formatter(tag, log_flags, priority).inputRangeObject;
+  } else {
+    output = to_output(new SyslogSink(tag, log_flags, priority));
+  }
+
+  copy(input, output);
 }
 
+struct SocketSink {
+  Socket socket;
+  void put(const char[] message) {
+    socket.send(message);
+  }
+}
+
+class SyslogSink {
+  this(string tag, int log_flags, int priority) {
+    openlog(tag.toStringz, log_flags, 0);
+    this.priority = priority;
+  }
+
+  ~this() {
+    closelog();
+  }
+
+  void put(const char[] message)
+  in { assert(strlen(message.ptr) <= message.length); }
+  body {
+    syslog(priority, "%s", message.ptr);
+  }
+
+  int priority;
+}
+
+// since syslog doesn't have a function to just format a message without
+// sending it, the formatting logic is duplicated here (just as it is in
+// logger.c)
+auto syslog_formatter(R)(R source, string tag, int log_flags, int priority) {
+  char[] buffer;
+  string pid = (log_flags & LOG_PID) ? format("[%d]", getpid()) : "";
+
+  char[] format_message(const char[] message) {
+    time_t now = void;
+    time(&now);
+    auto tp = (ctime(&now)+4)[0..15];
+
+    size_t needed_size = 25 /* priority fudge */ + tp.length + tag.length + pid.length + message.length + 7;
+    if (buffer.length < needed_size) {
+      buffer.length = needed_size;
+    }
+
+    // using C snprintf here instead of std.string.sformat, since I saw GC
+    // allocations with sformat (DMD v2.064.2)
+    snprintf(buffer.ptr, buffer.length, "<%d>%.15s %.*s%.*s: %s\n",
+        priority, tp.ptr, tag.length, tag.ptr, pid.length, pid.ptr, message.ptr);
+    return buffer[0..strlen(buffer.ptr)];
+  }
+
+  return map!(format_message)(source);
+}
+
+// TODO: this assumes OSX enum values, probably won't compile on other unixes
 enum PRIORITY_NAMES = [
   "alert":    LOG_ALERT,
   "crit" :    LOG_CRIT,
@@ -151,14 +168,16 @@ enum PRIORITY_NAMES = [
   "local7":   LOG_LOCAL7,
 ];
 
-int parse_priority(string priority) {
-  int result;
-  foreach (part; priority.split(".")) {
-    int *p = part in PRIORITY_NAMES;
-    if (p) result |= *p;
-    else {
-      throw new Exception(format("Unknown priority %s", part));
-    }
-  }
-  return result;
+int parse_priority(string priorities) {
+  auto lookup = (string part) =>
+    *enforce(part in PRIORITY_NAMES,
+             format("Unknown priority %s", part));
+  return priorities.split(".").map!(lookup).reduce!("a | b");
+}
+
+unittest {
+  assert(parse_priority("uucp") == LOG_UUCP);
+  assert(parse_priority("news.warn.info") == (LOG_NEWS | LOG_WARNING | LOG_INFO));
+  assertThrown(parse_priority("news.wut"));
+  assertThrown(parse_priority("wut"));
 }
