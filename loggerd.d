@@ -137,7 +137,6 @@ auto syslog_formatter(R)(R source, string tag, int log_flags, int priority) {
   return map!(format_message)(source);
 }
 
-// TODO: this assumes OSX enum values, probably won't compile on other unixes
 enum PRIORITY_NAMES = [
   "alert":    LOG_ALERT,
   "crit" :    LOG_CRIT,
