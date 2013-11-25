@@ -1,2 +1,4 @@
 loggerd
 *.o
+*.deb
+.vagrant
