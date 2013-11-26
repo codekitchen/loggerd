@@ -11,6 +11,6 @@ Vagrant.configure("2") do |config|
     wget -q http://downloads.dlang.org/releases/2013/dmd_2.064.2-0_amd64.deb
     dpkg -i dmd_2.064.2-0_amd64.deb
   fi
-  gem install fpm --no-rdoc --no-ri
+  gem install fpm-cookery --no-rdoc --no-ri
   SCRIPT
 end
